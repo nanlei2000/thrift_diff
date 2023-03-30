@@ -17,8 +17,6 @@
  * under the License.
  */
 var util = require('util');
-var http = require('http');
-var https = require('https');
 var EventEmitter = require('events').EventEmitter;
 var thrift = require('./thrift');
 
@@ -34,24 +32,26 @@ var createClient = require('./create_client');
  * @property {string} transport - The Thrift layered transport to use (TBufferedTransport, etc).
  * @property {string} protocol - The Thrift serialization protocol to use (TBinaryProtocol, etc.).
  * @property {string} path - The URL path to POST to (e.g. "/", "/mySvc", "/thrift/quoteSvc", etc.).
- * @property {object} headers - A standard Node.js header hash, an object hash containing key/value
+ * @property {object} header - A standard Node.js header hash, an object hash containing key/value
  *        pairs where the key is the header name string and the value is the header value string.
- * @property {boolean} https - True causes the connection to use https, otherwise http is used.
- * @property {object} nodeOptions - Options passed on to node.
+ * @property {object} requestOptions - Options passed on to http request. Details:
+ * https://developer.harmonyos.com/en/docs/documentation/doc-references/js-apis-net-http-0000001168304341#section12262183471518
  * @example
  *     //Use a connection that requires ssl/tls, closes the connection after each request,
  *     //  uses the buffered transport layer, uses the JSON protocol and directs RPC traffic
  *     //  to https://thrift.example.com:9090/hello
+ *     import http from '@ohos.net.http' // HTTP module of OpenHarmonyOS
  *     var thrift = require('thrift');
  *     var options = {
  *        transport: thrift.TBufferedTransport,
  *        protocol: thrift.TJSONProtocol,
  *        path: "/hello",
- *        headers: {"Connection": "close"},
- *        https: true
+ *        headers: {"Connection": "close"}
  *     };
- *     var con = thrift.createHttpConnection("thrift.example.com", 9090, options);
- *     var client = thrift.createHttpClient(myService, connection);
+ *     // With OpenHarmonyOS HTTP module, HTTPS is supported by default. To support HTTP, See:
+ *     // https://developer.harmonyos.com/en/docs/documentation/doc-references/js-apis-net-http-0000001168304341#EN-US_TOPIC_0000001171944450__s56d19203690d4782bfc74069abb6bd71
+ *     var con = thrift.createOhosConnection(http.createHttp, "thrift.example.com", 9090, options);
+ *     var client = thrift.createOhosClient(myService, connection);
  *     client.myServiceFunction();
  */
 
@@ -65,11 +65,11 @@ var createClient = require('./create_client');
  *     request or response processing, in which case the node error is passed on. An "error"
  *     event may also be fired when the connection can not map a response back to the
  *     appropriate client (an internal error), generating a TApplicationException.
- * @classdesc HttpConnection objects provide Thrift end point transport
- *     semantics implemented over the Node.js http.request() method.
- * @see {@link createHttpConnection}
+ * @classdesc OhosConnection objects provide Thrift end point transport
+ *     semantics implemented over the OpenHarmonyOS http.request() method.
+ * @see {@link createOhosConnection}
  */
-var HttpConnection = exports.HttpConnection = function(options) {
+var OhosConnection = exports.OhosConnection = function(options) {
   //Initialize the emitter base object
   EventEmitter.call(this);
 
@@ -78,27 +78,30 @@ var HttpConnection = exports.HttpConnection = function(options) {
   this.options = options || {};
   this.host = this.options.host;
   this.port = this.options.port;
-  this.socketPath = this.options.socketPath;
-  this.https = this.options.https || false;
+  this.path = this.options.path || '/';
+  //OpenHarmonyOS needs URL for initiating an HTTP request.
+  this.url =
+    this.port === 80
+      ? this.host.replace(/\/$/, '') + this.path
+      : this.host.replace(/\/$/, '') + ':' + this.port + this.path;
   this.transport = this.options.transport || TBufferedTransport;
   this.protocol = this.options.protocol || TBinaryProtocol;
+  //Inherit method from OpenHarmonyOS HTTP module
+  this.createHttp = this.options.createHttp;
 
-  //Prepare Node.js options
-  this.nodeOptions = {
-    host: this.host,
-    port: this.port,
-    socketPath: this.socketPath,
-    path: this.options.path || '/',
+  //Prepare HTTP request options
+  this.requestOptions = {
     method: 'POST',
-    headers: this.options.headers || {},
-    responseType: this.options.responseType || null
+    header: this.options.header || {},
+    readTimeout: this.options.readTimeout || 60000,
+    connectTimeout: this.options.connectTimeout || 60000
   };
-  for (var attrname in this.options.nodeOptions) {
-    this.nodeOptions[attrname] = this.options.nodeOptions[attrname];
+  for (var attrname in this.options.requestOptions) {
+    this.requestOptions[attrname] = this.options.requestOptions[attrname];
   }
   /*jshint -W069 */
-  if (! this.nodeOptions.headers['Connection']) {
-    this.nodeOptions.headers['Connection'] = 'keep-alive';
+  if (!this.requestOptions.header['Connection']) {
+    this.requestOptions.header['Connection'] = 'keep-alive';
   }
   /*jshint +W069 */
 
@@ -165,91 +168,82 @@ var HttpConnection = exports.HttpConnection = function(options) {
 
   //Response handler
   //////////////////////////////////////////////////
-  this.responseCallback = function(response) {
+  this.responseCallback = function(error, response) {
+    //Response will be a struct like:
+    // https://developer.harmonyos.com/en/docs/documentation/doc-references/js-apis-net-http-0000001168304341#section15920192914312
     var data = [];
     var dataLen = 0;
 
-    if (response.statusCode !== 200) {
-      this.emit("error", new THTTPException(response));
+    if (error) {
+      self.emit('error', error);
+      return;
     }
 
-    response.on('error', function (e) {
-      self.emit("error", e);
-    });
+    if (!response || response.responseCode !== 200) {
+      self.emit('error', new THTTPException(response));
+    }
 
-    // When running directly under node, chunk will be a buffer,
-    // however, when running in a Browser (e.g. Browserify), chunk
+    // With OpenHarmonyOS running in a Browser (e.g. Browserify), chunk
     // will be a string or an ArrayBuffer.
-    response.on('data', function (chunk) {
-      if ((typeof chunk == 'string') ||
-          (Object.prototype.toString.call(chunk) == '[object Uint8Array]')) {
-        // Wrap ArrayBuffer/string in a Buffer so data[i].copy will work
-        data.push(new Buffer(chunk));
-      } else {
-        data.push(chunk);
-      }
-      dataLen += chunk.length;
-    });
+    if (
+      typeof response.result == 'string' ||
+      Object.prototype.toString.call(response.result) == '[object Uint8Array]'
+    ) {
+      // Wrap ArrayBuffer/string in a Buffer so data[i].copy will work
+      data.push(Buffer.from(response.result));
+    }
+    dataLen += response.result.length;
 
-    response.on('end', function(){
-      var buf = new Buffer(dataLen);
-      for (var i=0, len=data.length, pos=0; i<len; i++) {
-        data[i].copy(buf, pos);
-        pos += data[i].length;
-      }
-      //Get the receiver function for the transport and
-      //  call it with the buffer
-      self.transport.receiver(decodeCallback)(buf);
-    });
+    var buf = Buffer.alloc(dataLen);
+    for (var i = 0, len = data.length, pos = 0; i < len; i++) {
+      data[i].copy(buf, pos);
+      pos += data[i].length;
+    }
+    //Get the receiver function for the transport and
+    //  call it with the buffer
+    self.transport.receiver(decodeCallback)(buf);
+  };
+
+  /**
+   * Writes Thrift message data to the connection
+   * @param {Buffer} data - A Node.js Buffer containing the data to write
+   * @returns {void} No return value.
+   * @event {error} the "error" event is raised upon request failure passing the
+   *     Node.js error object to the listener.
+   */
+  this.write = function(data) {
+    //To initiate multiple HTTP requests, we must create an HttpRequest object
+    // for each HTTP request
+    var http = self.createHttp();
+    var opts = self.requestOptions;
+    opts.header["Content-length"] = data.length;
+    if (!opts.header["Content-Type"])
+      opts.header["Content-Type"] = "application/x-thrift";
+    // extraData not support array data currently
+    opts.extraData = data.toString();
+    http.request(self.url, opts, self.responseCallback);
   };
 };
-util.inherits(HttpConnection, EventEmitter);
+util.inherits(OhosConnection, EventEmitter);
 
 /**
- * Writes Thrift message data to the connection
- * @param {Buffer} data - A Node.js Buffer containing the data to write
- * @returns {void} No return value.
- * @event {error} the "error" event is raised upon request failure passing the
- *     Node.js error object to the listener.
- */
-HttpConnection.prototype.write = function(data) {
-  var self = this;
-  var opts = self.nodeOptions;
-  opts.headers["Content-length"] = data.length;
-  if (!opts.headers["Content-Type"])
-    opts.headers["Content-Type"] = "application/x-thrift";
-  var req = (self.https) ?
-      https.request(opts, self.responseCallback) :
-      http.request(opts, self.responseCallback);
-  req.on('error', function(err) {
-    self.emit("error", err);
-  });
-  req.write(data);
-  req.end();
-};
-
-/**
- * Creates a new HttpConnection object, used by Thrift clients to connect
+ * Creates a new OhosConnection object, used by Thrift clients to connect
  *    to Thrift HTTP based servers.
+ * @param {Function} createHttp - OpenHarmonyOS method to initiate or destroy an HTTP request.
  * @param {string} host - The host name or IP to connect to.
  * @param {number} port - The TCP port to connect to.
  * @param {ConnectOptions} options - The configuration options to use.
- * @returns {HttpConnection} The connection object.
+ * @returns {OhosConnection} The connection object.
  * @see {@link ConnectOptions}
  */
-exports.createHttpConnection = function(host, port, options) {
+exports.createOhosConnection = function(createHttp, host, port, options) {
+  options.createHttp = createHttp;
   options.host = host;
   options.port = port || 80;
-  return new HttpConnection(options);
+  return new OhosConnection(options);
 };
 
-exports.createHttpUDSConnection = function(path, options) {
-  options.socketPath = path;
-  return new HttpConnection(options);
-};
-
-exports.createHttpClient = createClient
-
+exports.createOhosClient = createClient;
 
 function THTTPException(response) {
   thrift.TApplicationException.call(this);
@@ -258,9 +252,10 @@ function THTTPException(response) {
   }
 
   this.name = this.constructor.name;
-  this.statusCode = response.statusCode;
+  this.responseCode = response.responseCode;
   this.response = response;
   this.type = thrift.TApplicationExceptionType.PROTOCOL_ERROR;
-  this.message = "Received a response with a bad HTTP status code: " + response.statusCode;
+  this.message =
+    'Received a response with a bad HTTP status code: ' + response.responseCode;
 }
 util.inherits(THTTPException, thrift.TApplicationException);
