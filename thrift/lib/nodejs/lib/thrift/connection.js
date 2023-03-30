@@ -44,6 +44,7 @@ var Connection = exports.Connection = function(stream, options) {
   this.protocol = this.options.protocol || TBinaryProtocol;
   this.offline_queue = [];
   this.connected = false;
+  this.forceClose = false;
   this.initialize_retry_vars();
 
   this._debug = this.options.debug || false;
@@ -74,10 +75,7 @@ var Connection = exports.Connection = function(stream, options) {
     this.framePos = 0;
     this.frame = null;
     self.initialize_retry_vars();
-
-    self.offline_queue.forEach(function(data) {
-      self.connection.write(data);
-    });
+    self.flush_offline_queue();
 
     self.emit("connect");
   });
@@ -162,6 +160,7 @@ var Connection = exports.Connection = function(stream, options) {
 util.inherits(Connection, EventEmitter);
 
 Connection.prototype.end = function() {
+  this.forceClose = true;
   this.connection.end();
 };
 
@@ -177,6 +176,18 @@ Connection.prototype.initialize_retry_vars = function () {
   this.attempts = 0;
 };
 
+Connection.prototype.flush_offline_queue = function () {
+  var self = this;
+  var offline_queue = this.offline_queue;
+
+  // Reset offline queue
+  this.offline_queue = [];
+  // Attempt to write queued items
+  offline_queue.forEach(function(data) {
+    self.write(data);
+  });
+};
+
 Connection.prototype.write = function(data) {
   if (!this.connected) {
     this.offline_queue.push(data);
@@ -188,6 +199,16 @@ Connection.prototype.write = function(data) {
 Connection.prototype.connection_gone = function () {
   var self = this;
   this.connected = false;
+
+  // If closed by manual, emit close event and cancel reconnect process
+  if(this.forceClose) {
+    if (this.retry_timer) {
+      clearTimeout(this.retry_timer);
+      this.retry_timer = null;
+    }
+    self.emit("close");
+    return;
+  }
 
   // If a retry is already in progress, just let that happen
   if (this.retry_timer) {
@@ -242,7 +263,11 @@ Connection.prototype.connection_gone = function () {
 };
 
 exports.createConnection = function(host, port, options) {
-  var stream = net.createConnection(port, host);
+  var stream = net.createConnection( {
+    port: port,
+    host: host,
+    timeout: options.connect_timeout || options.timeout || 0
+  });
   var connection = new Connection(stream, options);
   connection.host = host;
   connection.port = port;
@@ -306,10 +331,7 @@ var StdIOConnection = exports.StdIOConnection = function(command, options) {
   this.frame = null;
   this.connected = true;
 
-  self.offline_queue.forEach(function(data) {
-      self.connection.write(data);
-  });
-
+  self.flush_offline_queue();
 
   this.connection.addListener("error", function(err) {
     self.emit("error", err);
@@ -352,6 +374,18 @@ util.inherits(StdIOConnection, EventEmitter);
 
 StdIOConnection.prototype.end = function() {
   this.connection.end();
+};
+
+StdIOConnection.prototype.flush_offline_queue = function () {
+  var self = this;
+  var offline_queue = this.offline_queue;
+
+  // Reset offline queue
+  this.offline_queue = [];
+  // Attempt to write queued items
+  offline_queue.forEach(function(data) {
+    self.write(data);
+  });
 };
 
 StdIOConnection.prototype.write = function(data) {
